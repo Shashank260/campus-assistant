@@ -1,0 +1,25 @@
+ # Environment variables — never push API keys
+.env
+
+# Database files — recreated on startup
+db/
+
+# Embeddings cache — large, redownloaded automatically
+.embeddings_cache/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
