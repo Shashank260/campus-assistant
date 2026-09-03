@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -54,10 +54,12 @@ from memory.sqlite_client import (
     delete_conversation,
     save_message,
     get_user_settings,      # ← add
-    save_user_settings, 
+    save_user_settings,
+    get_conversation_notion_page,
+    set_conversation_notion_page,
 )
 from memory.stm_manager import load_stm_context, save_and_update_stm, build_prompt_messages
-from notion.notion_push import push_to_notion, verify_notion_connection
+from notion.notion_push import push_to_notion, append_to_notion_page, verify_notion_connection, clean_notion_page_id
 
 # ── Lifespan — runs once on startup ───────────────────────────────────────────
 
@@ -109,6 +111,7 @@ class ChatResponse(BaseModel):
     sources:         list[SourceInfo]
     conversation_id: str
     model_used:      str
+    intent:          str = ""    # ← add this
 
 
 class NewConversationRequest(BaseModel):
@@ -121,9 +124,10 @@ class NotionSetupRequest(BaseModel):
 
 
 class NotionPushRequest(BaseModel):
-    user_id:    str
-    content:    str = Field(..., min_length=1)
-    page_title: str = ""
+    user_id:            str
+    content:            str = Field(..., min_length=1)
+    conversation_id:    str = ""
+    conversation_title: str = ""
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 
@@ -138,18 +142,19 @@ def get_llm(fast: bool = False) -> ChatGoogleGenerativeAI:
     )
 
 def extract_text(content) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "".join(
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        return content.get("text", "")
+    if isinstance(content, list):
+        return "".join(
             block.get("text", "") if isinstance(block, dict)
             else getattr(block, "text", "")
             for block in content
             if (isinstance(block, dict) and block.get("type") == "text")
             or (hasattr(block, "type") and getattr(block, "type") == "text")
-            )
-        return str(content)
-
+        )
+    return str(content)
 # ── /chat — Phase 2 ───────────────────────────────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse)
@@ -226,6 +231,7 @@ async def chat(req: ChatRequest):
         sources         = sources,
         conversation_id = req.conversation_id,
         model_used      = GEMMA_MODEL_FAST if req.fast_mode else GEMMA_MODEL,
+        intent          = result.get("intent", ""),
     )
 
 # ── Conversation thread endpoints ──────────────────────────────────────────────
@@ -353,6 +359,7 @@ async def context_image_endpoint(
     user_id:         str        = Form(...),
     question:        str        = Form(default=""),
     conversation_id: str        = Form(default=""),
+    api_key:         str        = Form(default=""),    # ← add this
     file:            UploadFile = File(...),
 ):
     suffix = Path(file.filename).suffix.lower()
@@ -361,30 +368,21 @@ async def context_image_endpoint(
     contents = await file.read()
     if len(contents) / (1024 * 1024) > IMAGE_MAX_SIZE_MB:
         raise HTTPException(status_code=413, detail=f"Image too large. Max {IMAGE_MAX_SIZE_MB} MB.")
+
     try:
         image_result = process_image_for_context(
             image_bytes = contents,
             filename    = file.filename,
             question    = question,
+            api_key     = api_key,        # ← pass through
         )
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    context_str  = format_image_context_for_llm(image_result)
-    user_content = context_str
-    if question:
-        user_content += f"\n\nStudent's question: {question}"
-
-    try:
-        llm      = get_llm()
-        response = llm.invoke([
-            SystemMessage(content="You are a helpful study assistant. Use the OCR text and visual analysis to answer clearly."),
-            HumanMessage(content=user_content),
-        ])
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM error: {e}")
-
-    answer = extract_text(response.content)
+    # Gemma vision already answered in process_image_for_context
+    # No second LLM call needed
+    answer      = image_result["visual_description"]
+    context_str = format_image_context_for_llm(image_result)
 
     if conversation_id:
         conv = await asyncio.to_thread(get_conversation, conversation_id)
@@ -399,12 +397,73 @@ async def context_image_endpoint(
 
     return {
         "response":   answer,
-        "ocr_text":   image_result["ocr_text"],
-        "has_text":   image_result["has_text"],
         "filename":   image_result["filename"],
         "model_used": GEMMA_MODEL,
     }
 
+# main.py  ── add this new endpoint
+
+class ContextQueryRequest(BaseModel):
+    user_id:         str
+    query:           str = Field(..., min_length=1)
+    conversation_id: str = ""
+    fast_mode:       bool = False
+    api_key:         str  = ""
+
+
+@app.post("/context/query")
+async def context_query(req: ContextQueryRequest):
+    """
+    Ephemeral RAG query — retrieves from the student's personal collection
+    and returns a grounded answer without saving to conversation history.
+    Use for quick lookups; for full chat with memory use POST /chat.
+    """
+    # ── Retrieve relevant chunks ───────────────────────────────────────────
+    try:
+        chunks = await asyncio.to_thread(retrieve, req.query, req.user_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Retrieval error: {e}")
+
+    context_str = format_context(chunks)
+
+    # ── Call LLM ──────────────────────────────────────────────────────────
+    try:
+        llm = get_llm(fast=req.fast_mode)
+        response = llm.invoke([
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=f"Context:\n{context_str}\n\nQuestion: {req.query}"),
+        ])
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM error: {e}")
+
+    answer = extract_text(response.content)
+
+    # ── Optionally save to STM if a valid conversation is provided ─────────
+    if req.conversation_id and req.user_id:
+        conv = await asyncio.to_thread(get_conversation, req.conversation_id)
+        if conv and conv["user_id"] == req.user_id:
+            asyncio.create_task(asyncio.to_thread(
+                save_and_update_stm,
+                req.conversation_id,
+                req.query,
+                answer,
+            ))
+
+    sources = [
+        SourceInfo(
+            doc_title   = c.get("doc_title", "Unknown"),
+            source_type = c.get("source_type", "unknown"),
+            page        = c.get("page", ""),
+            score       = c.get("score", 0.0),
+        )
+        for c in chunks
+    ]
+
+    return {
+        "response": answer,
+        "sources":  sources,
+        "model_used": GEMMA_MODEL_FAST if req.fast_mode else GEMMA_MODEL,
+    }
 
 # ── YouTube Transcript Tool ───────────────────────────────────────────────────
 
@@ -417,48 +476,58 @@ PROMPT_STYLES = {
 
 
 def _extract_video_id(url: str) -> str:
+    """
+    Extract YouTube video ID from any standard URL format.
+    Cleanly strips tracking parameters like ?si=...
+    """
     from urllib.parse import urlparse, parse_qs
     parsed = urlparse(url)
+
     if parsed.hostname in ("youtu.be",):
-        return parsed.path.lstrip("/")
+        path_parts = parsed.path.lstrip("/").split("?")[0]
+        return path_parts.split("/")[0]
+
     if parsed.hostname in ("www.youtube.com", "youtube.com"):
         if parsed.path == "/watch":
             qs = parse_qs(parsed.query)
             if "v" in qs:
                 return qs["v"][0]
         if parsed.path.startswith("/shorts/"):
-            return parsed.path.split("/shorts/")[1].split("/")[0]
+            return parsed.path.split("/shorts/")[1].split("?")[0].split("/")[0]
+
     raise ValueError(f"Could not extract video ID from URL: {url}")
 
 
 @app.get("/tools/youtube/languages")
-async def youtube_languages(url: str):
+async def youtube_languages(url: str = Query(..., description="Full YouTube URL")):
     """
     Step 1 — fetch available transcript languages for a video.
-    Tries common languages and reports which ones are available.
+    Compatible with youtube-transcript-api v1.x (instance-based API).
     """
-    from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+    from youtube_transcript_api import YouTubeTranscriptApi
 
     try:
         video_id = _extract_video_id(url)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    # New API — try fetching with no language preference to discover what's available
-    yt_api   = YouTubeTranscriptApi()
-    COMMON = ["en", "hi", "kn", "ta", "te", "bn", "ml", "mr", "gu", "pa", "ur", "es", "fr", "de", "zh", "ar", "pt", "ru", "ja", "ko"]
-    available = []
+    try:
+        # v1.x: must instantiate, then call .list() (not .list_transcripts())
+        api = YouTubeTranscriptApi()
+        transcript_list = api.list(video_id)
 
-    for lang in COMMON:
-        try:
-            fetched = yt_api.fetch(video_id, languages=[lang])
+        available = []
+        for t in transcript_list:
             available.append({
-                "code":          lang,
-                "name":          fetched.language,
-                "auto_generated": fetched.is_generated,
+                "code":           t.language_code,
+                "name":           t.language,
+                "auto_generated": t.is_generated,
             })
-        except Exception:
-            continue
+    except Exception as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not retrieve transcript list for video: {e}"
+        )
 
     if not available:
         raise HTTPException(
@@ -491,13 +560,25 @@ async def youtube_tool(req: YouTubeToolRequest):
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    # ── Fetch transcript ──────────────────────────────────────────────────────
     try:
-        yt_api     = YouTubeTranscriptApi()
-        fetched    = yt_api.fetch(video_id, languages=[req.language_code])
-        raw_transcript  = " ".join(chunk.text for chunk in fetched).strip()
+        # v1.x: must instantiate first; no more class-level list_transcripts()
+        api = YouTubeTranscriptApi()
+        transcript_list = api.list(video_id)
+        transcript_meta = transcript_list.find_transcript([req.language_code])
+        fetched         = api.fetch(video_id, languages=[req.language_code])
+
+        # FetchedTranscript is iterable; each snippet is a dataclass with .text, .start, .duration
+        raw_transcript  = " ".join(snippet.text for snippet in fetched).strip()
         auto_generated  = fetched.is_generated
         detected_lang   = fetched.language
+    except NoTranscriptFound:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No transcript in '{req.language_code}' for video: {video_id}. "
+                   f"Check available languages via GET /tools/youtube/languages."
+        )
+    except TranscriptsDisabled:
+        raise HTTPException(status_code=422, detail=f"Transcripts are disabled for video: {video_id}")
     except Exception as e:
         raise HTTPException(
             status_code=422,
@@ -568,7 +649,6 @@ async def youtube_tool(req: YouTubeToolRequest):
         "prompt_style":      req.prompt_style,
     }
     
-    
 # ── Notion endpoints ──────────────────────────────────────────────────────────
 
 @app.post("/notion/setup")
@@ -581,11 +661,12 @@ async def notion_setup(req: NotionSetupRequest):
       2. Share their master page with the integration
       3. Paste the integration token + page ID here
     """
+    cleaned_page_id = clean_notion_page_id(req.notion_page_id)
     try:
         valid = await asyncio.to_thread(
             verify_notion_connection,
             req.notion_key,
-            req.notion_page_id,
+            cleaned_page_id,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not reach Notion API: {e}")
@@ -601,7 +682,7 @@ async def notion_setup(req: NotionSetupRequest):
         save_user_settings,
         req.user_id,
         req.notion_key,
-        req.notion_page_id,
+        cleaned_page_id,
     )
 
     return {"status": "ok", "message": "Notion connected successfully."}
@@ -623,9 +704,10 @@ async def notion_status(user_id: str):
 @app.post("/notion/push")
 async def notion_push(req: NotionPushRequest):
     """
-    Push a single assistant response to Notion as a dated subpage.
-    Student selects any response in chat and clicks Push to Notion.
-    No LLM involved — content pushed as-is.
+    Push an assistant response to Notion.
+    - First push from a conversation → creates a sub-page titled after the conversation.
+    - Subsequent pushes from the same conversation → appends to the existing sub-page.
+    - No conversation_id → creates a standalone dated sub-page (legacy behaviour).
     """
     settings = await asyncio.to_thread(get_user_settings, req.user_id)
     if not settings or not settings.get("notion_key"):
@@ -634,15 +716,52 @@ async def notion_push(req: NotionPushRequest):
             detail="Notion not connected. Set up via POST /notion/setup first."
         )
 
+    notion_key     = settings["notion_key"]
+    master_page_id = settings["notion_page_id"]
+
     try:
-        result = await asyncio.to_thread(
-            push_to_notion,
-            settings["notion_key"],
-            settings["notion_page_id"],
-            req.content,
-            req.page_title,
-        )
+        # If a conversation_id is provided, try the per-conversation flow
+        if req.conversation_id:
+            existing_page_id = await asyncio.to_thread(
+                get_conversation_notion_page, req.conversation_id
+            )
+
+            if existing_page_id:
+                # Append to existing sub-page
+                result = await asyncio.to_thread(
+                    append_to_notion_page,
+                    notion_key,
+                    existing_page_id,
+                    req.content,
+                )
+            else:
+                # First push — create a new sub-page for this conversation
+                conv = await asyncio.to_thread(get_conversation, req.conversation_id)
+                page_title = conv["title"] if (conv and conv.get("title")) else (req.conversation_title or "Chat notes")
+                result = await asyncio.to_thread(
+                    push_to_notion,
+                    notion_key,
+                    master_page_id,
+                    req.content,
+                    page_title,
+                )
+                # Store the notion page ID on the conversation for future appends
+                await asyncio.to_thread(
+                    set_conversation_notion_page,
+                    req.conversation_id,
+                    result["page_id"],
+                )
+        else:
+            # No conversation_id — legacy standalone push
+            result = await asyncio.to_thread(
+                push_to_notion,
+                notion_key,
+                master_page_id,
+                req.content,
+                "",
+            )
     except ValueError as e:
+        print(f"[notion] Push failed: {e}")
         raise HTTPException(status_code=502, detail=str(e))
 
     return result

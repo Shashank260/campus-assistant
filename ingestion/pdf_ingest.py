@@ -58,7 +58,7 @@ def ingest_pdf(
         raise ValueError(f"Expected a .pdf file, got: {path.suffix}")
 
     title = doc_title or path.stem
-    print(f"[pdf_ingest] Loading: {path.name} → personal_{user_id}")
+    print(f"[pdf_ingest] Loading: {path.name} -> personal_{user_id}")
 
     # ── Load pages ────────────────────────────────────────────────────────────
     loader = PyPDFLoader(str(path))
@@ -73,6 +73,12 @@ def ingest_pdf(
     )
     raw_chunks = splitter.split_documents(pages)
     print(f"[pdf_ingest]   Chunks: {len(raw_chunks)}")
+
+    if not raw_chunks:
+        raise ValueError(
+            f"No text could be extracted from '{path.name}'. "
+            "The PDF may be blank, scanned/image-only, or contain no selectable text."
+        )
 
     # ── Assign IDs + enrich metadata ──────────────────────────────────────────
     ids: list[str] = []

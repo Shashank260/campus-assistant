@@ -59,21 +59,24 @@ def get_embeddings() -> HuggingFaceEmbeddings:
 def get_personal_collection(user_id: str) -> Chroma:
     """
     Return the LangChain Chroma wrapper for a student's personal collection.
-    Collection is created automatically on first use if it doesn't exist.
+    Sanitizes spaces to maintain compliance with ChromaDB collection naming rules.
     """
+    # Replace all spaces with underscores and ensure lowercase uniformity
+    safe_user_id = user_id.strip().replace(" ", "_").lower()
+    
     return Chroma(
         client=get_chroma_client(),
-        collection_name=f"{PERSONAL_COLLECTION_PREFIX}{user_id}",
+        collection_name=f"{PERSONAL_COLLECTION_PREFIX}{safe_user_id}",
         embedding_function=get_embeddings(),
     )
 
 
 def personal_collection_stats(user_id: str) -> dict:
     """
-    Return doc count for a student's collection.
-    Returns count=0 if the collection doesn't exist yet (student hasn't uploaded anything).
+    Return doc count for a student's sanitized collection name string.
     """
-    collection_name = f"{PERSONAL_COLLECTION_PREFIX}{user_id}"
+    safe_user_id = user_id.strip().replace(" ", "_").lower()
+    collection_name = f"{PERSONAL_COLLECTION_PREFIX}{safe_user_id}"
     client = get_chroma_client()
     try:
         col = client.get_collection(collection_name)

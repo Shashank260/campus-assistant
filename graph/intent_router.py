@@ -2,12 +2,11 @@
 graph/intent_router.py — Hybrid intent classifier.
 
 Step 1: Rule-based check — obvious patterns, zero LLM, instant.
-Step 2: LLM classification — Gemma fast model, ~50 tokens, for ambiguous messages.
+Step 2: LLM classification — Gemma fast model, with user's doc titles injected.
 
 Intent categories:
-  casual         → greetings, thanks, acknowledgements
-  conversational → follow-ups, clarifications, references to prior context
-  personal_rag   → study queries that need document retrieval
+  conversational → greetings, thanks, follow-ups, general knowledge, clarifications
+  personal_rag   → study queries that match the student's uploaded documents
   introspect     → self-reflection on learning activity
 """
 
@@ -21,24 +20,14 @@ from config import GEMMA_MODEL_FAST, GEMINI_API_KEY
 
 # ── Rule-based patterns ────────────────────────────────────────────────────────
 
-# Obvious casual — greetings and acknowledgements in EN / HI / KN
-CASUAL_PATTERNS = [
-    r"^(hi|hello|hey|hii+|helo)\b",
-    r"^(thanks|thank you|thx|ty|thank)\b",
-    r"^(ok|okay|alright|got it|sure|fine|good)\b",
-    r"^(bye|goodbye|see you|cya)\b",
-    r"^(haan|ha|theek hai|theek|shukriya|dhanyavaad|sari|naan|acha|accha)\b",
-    r"^(👍|👋|🙏|😊|✅)$",
-    r"^(yes|no|nope|yep|yup)\b",
-]
-
-# Obvious RAG triggers — study queries that clearly need retrieval
+# Obvious RAG triggers — only very specific study actions, not generic what/how
 RAG_PATTERNS = [
-    r"\b(explain|summarise|summarize|summary|quiz|test me|find|search)\b",
-    r"\b(what is|what are|define|definition|describe|how does|how do)\b",
+    r"\b(explain|summarise|summarize|summary|quiz|test me)\b",
     r"\b(notes|lecture|chapter|topic|concept|formula|theorem|equation)\b",
+    r"\b(find in my|search my|from my notes|in my documents|from my docs)\b",
     r"\b(samjhao|samjha|batao|dhundho|quiz do|notes dikhao)\b",   # Hindi
     r"\b(helri|summary maadi|quiz kodi|nodri|explain maadi)\b",    # Kannada
+    r"\b(what is|how does|why is|explain the difference|define|derive)\b"
 ]
 
 # Obvious introspect triggers
@@ -50,17 +39,28 @@ INTROSPECT_PATTERNS = [
     r"\b(avalokana|introspect|reflect|meri progress|maine kya padha)\b",
 ]
 
-VALID_INTENTS = {"casual", "conversational", "personal_rag", "introspect"}
+VALID_INTENTS = {"conversational", "personal_rag", "introspect"}
 
-_CLASSIFIER_SYSTEM = """You are an intent classifier for a student study assistant.
-Classify the student's message into exactly ONE of these intents:
+_CLASSIFIER_SYSTEM = """<role>
+You are a deterministic, high-speed intent classification node in a student graph architecture. Your sole job is to evaluate a raw incoming student string and output exactly one token representing the intent category.
+</role>
 
-casual         — greeting, thanks, acknowledgement, filler (hi, ok, thanks, bye)
-conversational — follow-up or clarification on something already discussed (explain that again, what did you mean, continue)
-personal_rag   — a study question needing document retrieval (explain X, summarise chapter, find notes on Y, quiz me)
-introspect     — self-reflection on learning activity (what have I studied, my progress, topics covered, learning journey)
+<knowledge_base_state>
+The student has currently uploaded these files to their personal database directory:
+{doc_titles}
+</knowledge_base_state>
 
-Reply with ONLY the single intent word. No explanation. No punctuation."""
+<intent_categories>
+- conversational: Default fallback status. Greetings ("hi", "hello"), parting acknowledgments ("thanks", "bye"), casual validation loops ("ok", "makes sense"), generic programming questions, or broad general knowledge prompts (e.g., "explain how linear regression optimization works from scratch") that do NOT refer to any items listed in the <knowledge_base_state>.
+- personal_rag: High-priority data path. Triggered ONLY if the query specifically references a document title listed above, or demands structural lookup from their materials (e.g., "explain chapter 3 from my notes", "quiz me on the OS syllabus", "what does the uploaded guide say about virtual memory?").
+- introspect: Metacognitive data path. Triggered when the student wants an evaluation of their own usage habits, covered topics, upload counts, or progress history (e.g., "what have I studied today?", "give me my progress summary", "summarize the current chat so far").
+</intent_categories>
+
+<strict_rules>
+1. CRITICAL: If a question is general knowledge and does not directly reference or heavily imply an uploaded document title listed in <knowledge_base_state>, you MUST classify it as "conversational". Do not force a RAG lookup if they do not have relevant files.
+2. OUTPUT CONSTRAINT: Output exactly ONE of these exact lowercase text strings: "conversational", "personal_rag", or "introspect".
+3. ZERO TOLERANCE: Do not include punctuation, markdown backticks, whitespaces, trailing periods, or introductory commentary. The response must be a single, raw string token.
+</strict_rules>"""
 
 
 def _matches_any(text: str, patterns: list[str]) -> bool:
@@ -68,11 +68,37 @@ def _matches_any(text: str, patterns: list[str]) -> bool:
     return any(re.search(p, text, re.IGNORECASE) for p in patterns)
 
 
-def _llm_classify(query: str, api_key: str) -> str:
+def _fetch_doc_titles(user_id: str) -> str:
+    """
+    Fetch user's uploaded document titles from ChromaDB.
+    Returns formatted string for LLM prompt injection.
+    Falls back to empty string if fetch fails.
+    """
+    try:
+        from retrieval.chroma_client import get_personal_collection
+        collection = get_personal_collection(user_id)
+        result     = collection._collection.get(include=["metadatas"])
+        seen       = set()
+        titles     = []
+        for meta in result.get("metadatas", []):
+            title = meta.get("doc_title", "")
+            if title and title not in seen:
+                seen.add(title)
+                source = meta.get("source_type", "unknown")
+                titles.append(f"  - {title} ({source})")
+        if not titles:
+            return "  No documents uploaded yet."
+        return "\n".join(titles)
+    except Exception as e:
+        print(f"[intent_router] doc title fetch failed: {e}")
+        return "  Could not fetch documents."
+
+
+def _llm_classify(query: str, api_key: str, doc_titles: str) -> str:
     """
     Call Gemma fast model to classify intent.
-    Returns one of: casual / conversational / personal_rag / introspect
-    Falls back to 'personal_rag' if classification fails or returns unexpected value.
+    Injects user's doc titles so model can make context-aware decision.
+    Falls back to 'conversational' if classification fails.
     """
     key = api_key.strip() if api_key.strip() else GEMINI_API_KEY
     try:
@@ -80,13 +106,13 @@ def _llm_classify(query: str, api_key: str) -> str:
             model          = GEMMA_MODEL_FAST,
             google_api_key = key,
             temperature    = 0.0,
-            max_tokens     = 10,    # we only need one word
+            max_tokens     = 10,
         )
+        system_prompt = _CLASSIFIER_SYSTEM.format(doc_titles=doc_titles)
         response = llm.invoke([
-            SystemMessage(content=_CLASSIFIER_SYSTEM),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=f"Student message: {query}"),
         ])
-        # Extract text content
         content = response.content
         if isinstance(content, list):
             content = "".join(
@@ -98,42 +124,38 @@ def _llm_classify(query: str, api_key: str) -> str:
                 )
             )
         intent = content.strip().lower().rstrip(".")
-        return intent if intent in VALID_INTENTS else "personal_rag"
+        return intent if intent in VALID_INTENTS else "conversational"
     except Exception as e:
-        print(f"[intent_router] LLM classification failed: {e} — defaulting to personal_rag")
-        return "personal_rag"
+        print(f"[intent_router] LLM classification failed: {e} — defaulting to conversational")
+        return "conversational"
 
 
-def classify_intent(query: str, api_key: str = "") -> str:
+def classify_intent(query: str, api_key: str = "", user_id: str = "") -> str:
     """
     Hybrid intent classifier.
 
     Step 1 — Rule-based: catches obvious patterns instantly.
-    Step 2 — LLM: handles ambiguous messages.
+    Step 2 — LLM: handles ambiguous messages with doc titles injected.
 
     Args:
         query:   Student's message.
         api_key: User's Google AI Studio key (falls back to server key).
+        user_id: Used to fetch doc titles for context-aware LLM classification.
 
     Returns:
-        One of: casual / conversational / personal_rag / introspect
+        One of: conversational / personal_rag / introspect
     """
     # ── Step 1: Rule-based ────────────────────────────────────────────────────
-    # Short messages (≤4 words) that match casual patterns → instant casual
-    word_count = len(query.strip().split())
-    if word_count <= 4 and _matches_any(query, CASUAL_PATTERNS):
-        print(f"[intent_router] Rule → casual (short match): '{query}'")
-        return "casual"
-
     if _matches_any(query, INTROSPECT_PATTERNS):
-        print(f"[intent_router] Rule → introspect: '{query}'")
+        print(f"[intent_router] Rule -> introspect: '{query}'")
         return "introspect"
 
     if _matches_any(query, RAG_PATTERNS):
-        print(f"[intent_router] Rule → personal_rag: '{query}'")
+        print(f"[intent_router] Rule -> personal_rag: '{query}'")
         return "personal_rag"
 
-    # ── Step 2: LLM classification ────────────────────────────────────────────
-    intent = _llm_classify(query, api_key)
-    print(f"[intent_router] LLM → {intent}: '{query}'")
+    # ── Step 2: LLM classification with doc titles ────────────────────────────
+    doc_titles = _fetch_doc_titles(user_id) if user_id else "  No documents available."
+    intent     = _llm_classify(query, api_key, doc_titles)
+    print(f"[intent_router] LLM -> {intent}: '{query}'")
     return intent

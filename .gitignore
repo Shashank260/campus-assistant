@@ -1,4 +1,4 @@
- # Environment variables — never push API keys
+# Environment variables — never push API keys
 .env
 
 # Database files — recreated on startup
@@ -23,3 +23,10 @@ env/
 # Windows
 Thumbs.db
 desktop.ini
+
+# Frontend
+frontend/node_modules/
+
+# Scratch / Data
+frontend.zip
+handoff_report.md

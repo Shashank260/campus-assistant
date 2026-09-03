@@ -8,6 +8,7 @@ Chunking strategy: 120-second windows (not token-based).
 Rationale: transcript chunks tied to timestamps are more useful for citation
 ("this was explained around 14:30") than arbitrary token splits.
 """
+import os
 import hashlib
 from urllib.parse import urlparse, parse_qs
 
@@ -24,11 +25,14 @@ def _extract_video_id(url: str) -> str:
     """
     Extract YouTube video ID from any standard URL format.
     Handles: youtu.be/ID, youtube.com/watch?v=ID, youtube.com/shorts/ID
+    Cleanly strips tracking parameters like ?si=...
     """
+    from urllib.parse import urlparse, parse_qs
     parsed = urlparse(url)
 
     if parsed.hostname in ("youtu.be",):
-        return parsed.path.lstrip("/")
+        path_parts = parsed.path.lstrip("/").split("?")[0]
+        return path_parts.split("/")[0]
 
     if parsed.hostname in ("www.youtube.com", "youtube.com"):
         if parsed.path == "/watch":
@@ -36,7 +40,7 @@ def _extract_video_id(url: str) -> str:
             if "v" in qs:
                 return qs["v"][0]
         if parsed.path.startswith("/shorts/"):
-            return parsed.path.split("/shorts/")[1].split("/")[0]
+            return parsed.path.split("/shorts/")[1].split("?")[0].split("/")[0]
 
     raise ValueError(f"Could not extract video ID from URL: {url}")
 
@@ -79,10 +83,13 @@ def ingest_youtube(
 
     print(f"[youtube_ingest] Fetching transcript for: {video_id}")
 
-    # ── Fetch transcript ──────────────────────────────────────────────────────
     try:
-        yt_api = YouTubeTranscriptApi()
-        transcript_raw = yt_api.fetch(video_id, languages=[language_code])
+        # v1.x: must instantiate first; no more class-level list_transcripts()
+        api = YouTubeTranscriptApi()
+        transcript_list = api.list(video_id)
+        transcript_list.find_transcript([language_code])  # validates language exists
+        fetched = api.fetch(video_id, languages=[language_code])
+        transcript_raw = list(fetched)  # list of FetchedTranscriptSnippet(text, start, duration)
     except NoTranscriptFound:
         raise ValueError(
             f"No transcript in '{language_code}' for video: {video_id}. "
@@ -112,7 +119,7 @@ def ingest_youtube(
             window_start = segment.start
         current_window.append(segment)
 
-# flush last window
+    # flush last window
     if current_window:
         windows.append({
             "text":  " ".join(s.text for s in current_window),

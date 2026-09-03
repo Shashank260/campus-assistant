@@ -52,7 +52,8 @@ def fetch_transcript_for_context(url: str) -> dict:
     video_id = _extract_video_id(url)
 
     try:
-        segments = YouTubeTranscriptApi.get_transcript(video_id)
+        yt_api = YouTubeTranscriptApi()
+        segments = yt_api.fetch(video_id)
     except NoTranscriptFound:
         raise ValueError(f"No transcript available for: {video_id}")
     except TranscriptsDisabled:
@@ -60,10 +61,7 @@ def fetch_transcript_for_context(url: str) -> dict:
     except Exception as e:
         raise ValueError(f"Could not fetch transcript: {e}")
 
-    full_text = " ".join(
-        s.get("text", "") if isinstance(s, dict) else str(getattr(s, "text", ""))
-        or s in segments
-    ).strip()
+    full_text = " ".join(s.text for s in segments).strip()
     
     truncated = False
     if len(full_text) > CONTEXT_CHAR_LIMIT:

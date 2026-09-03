@@ -56,8 +56,13 @@ def retrieve(
 
     chunks = []
     for doc, distance in results:
-        # ChromaDB cosine distance → similarity (0=identical, 1=orthogonal, 2=opposite)
-        similarity = round(1.0 - (distance / 2.0), 4)
+        # Clamp distance safely between 0.0 and 2.0 to handle wrapper scaling variations
+        clamped_dist = max(0.0, min(float(distance), 2.0))
+        similarity = round(1.0 - (clamped_dist / 2.0), 4)
+        
+        # DEBUG LOG: Check your terminal when a query runs to see actual matching metrics
+        print(f"[DEBUG RAG] Doc: {doc.metadata.get('doc_title', 'Unknown')} | Distance: {distance:.4f} | Similarity: {similarity:.4f}")
+
         if similarity < score_threshold:
             continue
         chunks.append({

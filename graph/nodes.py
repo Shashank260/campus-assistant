@@ -4,9 +4,8 @@ graph/nodes.py — All LangGraph node functions for Campus Assistant.
 Each function takes GraphState, does one job, returns updated state fields.
 
 Nodes:
-  route_intent      → classifies query, sets state["intent"]
-  handle_casual     → direct reply, no RAG
-  handle_conversational → STM-only reply, no RAG
+  route_intent          → classifies query, sets state["intent"]
+  handle_conversational → greetings, general knowledge, follow-ups — no RAG
   handle_personal_rag   → full RAG flow
   handle_introspect     → learning coach flow
 """
@@ -21,6 +20,7 @@ from config import (
     GEMMA_MODEL,
     GEMMA_MODEL_FAST,
     SYSTEM_PROMPT,
+    CONVERSATIONAL_PROMPT,    
 )
 from graph.intent_router import classify_intent
 from graph.state import GraphState
@@ -74,53 +74,25 @@ def _build_stm_messages(state: GraphState) -> list:
 def route_intent(state: GraphState) -> GraphState:
     """
     Classify the student's query and set state["intent"].
-    Uses hybrid rule-based + LLM classifier.
+    Uses hybrid rule-based + LLM classifier with doc titles injected.
     """
     intent = classify_intent(
         query   = state["query"],
         api_key = state.get("api_key", ""),
+        user_id = state.get("user_id", ""),
     )
     return {**state, "intent": intent}
-
-
-# ── Node 2: Handle casual ──────────────────────────────────────────────────────
-
-def handle_casual(state: GraphState) -> GraphState:
-    """
-    Reply to casual messages (hi, thanks, ok).
-    Uses system prompt + STM summary only.
-    No RAG retrieval — fast response.
-    """
-    messages = [SystemMessage(content=SYSTEM_PROMPT)]
-
-    # Only inject summary — not full recent messages (overkill for "hi")
-    if state.get("stm_summary"):
-        messages.append(SystemMessage(
-            content=f"[Context from earlier]\n{state['stm_summary']}"
-        ))
-
-    messages.append(HumanMessage(content=state["query"]))
-
-    try:
-        llm      = _get_llm(state)
-        response = llm.invoke(messages)
-        answer   = _extract_text(response.content)
-    except Exception as e:
-        answer = "Hey! How can I help you with your studies today?"
-        print(f"[nodes] casual LLM failed: {e}")
-
-    return {**state, "final_response": answer, "sources": []}
-
 
 # ── Node 3: Handle conversational ─────────────────────────────────────────────
 
 def handle_conversational(state: GraphState) -> GraphState:
     """
-    Reply to follow-ups and clarifications.
+    Reply to greetings, general knowledge questions, follow-ups and clarifications.
+    Casual messages (hi, thanks, ok) are also handled here — no separate casual node.
     Uses full STM context (summary + recent messages).
-    No RAG retrieval — answer from conversation memory.
+    No RAG retrieval.
     """
-    messages = [SystemMessage(content=SYSTEM_PROMPT)]
+    messages = [SystemMessage(content=CONVERSATIONAL_PROMPT)]
     messages += _build_stm_messages(state)
     messages.append(HumanMessage(content=state["query"]))
 
@@ -183,21 +155,21 @@ def handle_personal_rag(state: GraphState) -> GraphState:
 
 # ── Node 5: Handle introspect ─────────────────────────────────────────────────
 
-INTROSPECT_SYSTEM = """You are a learning coach helping a student reflect on their study journey.
-You have access to:
-- What documents they have uploaded to their knowledge base
-- Their conversation history (topics discussed, questions asked)
-- When they studied (timestamps)
+INTROSPECT_SYSTEM = """<role>
+You are an empathetic, metrics-driven Academic Performance Coach. Your task is to analyze a student's system telemetry data (uploaded assets, chronological chat topic strings, and message volumes) to build a clear, actionable dashboard review of their learning patterns.
+</role>
 
-Your job is to help them understand:
-- What topics they have covered
-- Their learning patterns and habits
-- What areas they might be neglecting
-- Progress across subjects
-
-Be encouraging, specific, and insightful.
-Use the provided data to give concrete observations — not generic advice.
-Do not answer subject-matter questions — only reflect on their learning activity."""
+<instructions>
+1. ANALYSIS STRATEGY: 
+   - Cross-reference the user's active discussion history against their uploaded knowledge base files.
+   - Actively identify structural blind spots. For instance, if they uploaded "Computer_Networks_Syllabus.pdf" but their last 10 chat entries are exclusively about "Operating Systems", point out that they have not initiated lookups on their networking materials yet.
+2. ENGAGEMENT MODEL: Do not answer direct subject-matter questions. If they ask you how an algorithm works inside this node, re-route them by saying: "Let's track that subject directly in the chat panel! From a coaching perspective, that aligns perfectly with your notes on..."
+3. PRESENTATION STRUCTURE: 
+   - Format your review using a clean, scannable dashboard layout.
+   - Use a clear Markdown table to map out **Covered Concepts** vs. **Neglected Core Materials**.
+   - Conclude with a punchy, 2-bullet-point action plan for their next study session.
+4. PERSONALITY: Inspiring, data-oriented, and highly encouraging. Speak directly to their growth metrics.
+</instructions>"""
 
 
 def _get_doc_titles(user_id: str) -> list[dict]:

@@ -83,7 +83,17 @@ def _summarise_messages(messages: list[dict]) -> str:
             SystemMessage(content=_SUMMARISE_PROMPT),
             HumanMessage(content=f"Conversation to summarise:\n\n{transcript}"),
         ])
-        return response.content.strip()
+        content = response.content
+        if isinstance(content, list):
+            content = "".join(
+                b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")
+                for b in content
+                if (isinstance(b, dict) and b.get("type") == "text")
+                or (hasattr(b, "type") and getattr(b, "type") == "text")
+            )
+        elif isinstance(content, dict):
+            content = content.get("text", "")
+        return content.strip()
     except Exception as e:
         print(f"[stm] Summarisation failed (using fallback): {e}")
         # Fallback: truncate transcript to first 500 chars
@@ -144,10 +154,18 @@ def save_and_update_stm(
 
     This is synchronous — called via asyncio.to_thread() in main.py.
     """
-    from memory.sqlite_client import save_message, count_messages
+    from memory.sqlite_client import save_message, count_messages, touch_conversation, _make_title
+
+    # Check if this is the very first message in the conversation thread
+    is_first_message = (count_messages(conversation_id) == 0)
 
     save_message(conversation_id, "user",      user_message)
     save_message(conversation_id, "assistant", assistant_message)
+
+    # Automatically set conversation title from the first message
+    if is_first_message:
+        new_title = _make_title(user_message)
+        touch_conversation(conversation_id, title=new_title)
 
     total = count_messages(conversation_id)
 

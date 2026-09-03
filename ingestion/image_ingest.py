@@ -70,7 +70,7 @@ def ingest_image(
         )
 
     title = doc_title or path.stem
-    print(f"[image_ingest] Running OCR on: {path.name} → personal_{user_id}")
+    print(f"[image_ingest] Running OCR on: {path.name} -> personal_{user_id}")
 
     # ── OCR ───────────────────────────────────────────────────────────────────
     reader = get_reader()

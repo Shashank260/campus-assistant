@@ -53,7 +53,8 @@ def init_db() -> None:
                 title           TEXT NOT NULL DEFAULT 'New conversation',
                 created_at      TEXT NOT NULL,
                 last_active     TEXT NOT NULL,
-                stm_summary     TEXT NOT NULL DEFAULT ''
+                stm_summary     TEXT NOT NULL DEFAULT '',
+                notion_page_id  TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -79,6 +80,14 @@ def init_db() -> None:
                 ON messages(conversation_id, timestamp ASC);
         """)
         conn.commit()
+
+        # ── Migration: add notion_page_id column if missing (existing DBs) ────
+        try:
+            conn.execute("ALTER TABLE conversations ADD COLUMN notion_page_id TEXT NOT NULL DEFAULT ''")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
         print("[sqlite] Database initialised.")
     finally:
         conn.close()
@@ -294,6 +303,34 @@ def get_user_settings(user_id: str) -> dict | None:
             (user_id,)
         ).fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+# ── Notion page tracking per conversation ─────────────────────────────────────
+
+def get_conversation_notion_page(conversation_id: str) -> str:
+    """Return the Notion page ID linked to a conversation, or '' if none."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT notion_page_id FROM conversations WHERE conversation_id = ?",
+            (conversation_id,)
+        ).fetchone()
+        return row["notion_page_id"] if row else ""
+    finally:
+        conn.close()
+
+
+def set_conversation_notion_page(conversation_id: str, notion_page_id: str) -> None:
+    """Store the Notion page ID for a conversation after first push."""
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "UPDATE conversations SET notion_page_id = ? WHERE conversation_id = ?",
+            (notion_page_id, conversation_id)
+        )
+        conn.commit()
     finally:
         conn.close()
 # ── Helpers ───────────────────────────────────────────────────────────────────
